@@ -5,7 +5,7 @@
 //! It supports both client and server endpoints and handles various WebSocket features
 //! such as text and binary messages, ping/pong frames, and connection closing.
 //!
-//! This crate does not handle any extension negotiation or TLS. It focuses solely on the
+//! This crate does not handle any extension negotiation. It focuses solely on the
 //! WebSocket protocol as defined in RFC 6455.
 pub(crate) mod codec;
 pub(crate) mod connection;
