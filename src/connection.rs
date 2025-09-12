@@ -87,10 +87,15 @@ use crate::codec::{self, Opcode};
 /// A message returned to end-users from a WebSocket connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WebsocketMessage {
+    /// A string of text
     Text(String),
+    /// A block of binary data
     Binary(Vec<u8>),
+    /// A close operation with optional reason
     Close(Option<Vec<u8>>),
+    /// A ping
     Pong(Vec<u8>),
+    /// Response to ping
     Ping(Vec<u8>),
 }
 

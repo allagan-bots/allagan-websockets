@@ -1,3 +1,5 @@
+//! An example of a client that doesn't use TLS termination
+
 use allagan_websocket::Connection;
 use tokio::net::TcpStream;
 
