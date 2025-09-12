@@ -10,5 +10,5 @@
 pub(crate) mod codec;
 pub(crate) mod connection;
 
-pub use connection::{new_secure_client, new_secure_server, Connection, WebsocketMessage};
-pub use rustls;
+pub use connection::{client::ClientConnectionBuilder, Connection, WebsocketMessage};
+pub use http;

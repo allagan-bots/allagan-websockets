@@ -1,76 +1,13 @@
-//! WebSocket connection handling module.
-//! This module provides a `Connection` type that manages a WebSocket connection,
-//! handling framing, control frames, and message fragmentation according to RFC 6455.
+//! Shared WebSocket connection types and logic for both client and server.
 
-/// Perform a client-side WebSocket handshake over a secure (TLS) connection.
-/// # Arguments
-/// * `stream`: The underlying stream to use for the connection (e.g., a TCP stream).
-/// * `host`: The hostname of the server to connect to (used in the handshake and SNI).
-/// * `path`: The request path for the WebSocket handshake (usually "/").
-/// * `max_frame_size`: The maximum frame size for incoming messages; larger frames will be split.
-/// * `tls_config`: The Rustls client config to use for TLS.
-///
-/// # Errors
-/// Returns an error if the TLS or WebSocket handshake fails.
-pub async fn new_secure_client<T>(
-    stream: T,
-    host: &str,
-    path: &str,
-    max_frame_size: usize,
-    tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
-) -> Result<Connection<tokio_rustls::client::TlsStream<T>>, ConnectionError>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio_rustls::rustls::pki_types::ServerName;
-    use tokio_rustls::TlsConnector;
+pub(crate) mod client;
+pub(crate) mod server;
 
-    let tls_config = tls_config.unwrap_or(std::sync::Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(
-                webpki_roots::TLS_SERVER_ROOTS
-                    .iter()
-                    .cloned()
-                    .collect::<rustls::RootCertStore>(),
-            )
-            .with_no_client_auth(),
-    ));
-    let connector = TlsConnector::from(tls_config);
-    let host_owned: String = host.to_owned();
-    let server_name = ServerName::try_from(host_owned)
-        .map_err(|_| ConnectionError::ProtocolViolation("Invalid SNI/host for TLS"))?;
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|_| ConnectionError::ProtocolViolation("TLS handshake failed"))?;
-    Connection::new_insecure_client(tls_stream, host, path, max_frame_size).await
-}
+use crate::codec::{self, Opcode};
 
-/// Accept a server-side WebSocket handshake over a secure (TLS) connection.
-///
-/// # Arguments
-/// * `stream`: The underlying stream to use for the connection (e.g., a TCP stream).
-/// * `max_frame_size`: The maximum frame size for incoming messages; larger frames will be split.
-/// * `tls_config`: The Rustls server config to use for TLS.
-///
-/// # Errors
-/// Returns an error if the TLS or WebSocket handshake fails.
-pub async fn new_secure_server<T>(
-    stream: T,
-    max_frame_size: usize,
-    tls_config: std::sync::Arc<rustls::ServerConfig>,
-) -> Result<Connection<tokio_rustls::server::TlsStream<T>>, ConnectionError>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio_rustls::TlsAcceptor;
-    let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = acceptor
-        .accept(stream)
-        .await
-        .map_err(|_| ConnectionError::ProtocolViolation("TLS handshake failed"))?;
-    Connection::new_insecure_server(tls_stream, max_frame_size).await
-}
+// Trait alias for boxed stream type used in Connection
+pub trait WebSocketStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebSocketStream for T {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -80,9 +17,41 @@ pub enum ConnectionError {
     Closed,
     #[error("Codec error: {0}")]
     Codec(#[from] crate::codec::WebsocketCodecError),
+    #[error("Invalid URI: {0}")]
+    InvalidUri(&'static str),
+    #[error("Failed to connect to server")]
+    ConnectFailed,
+    #[error("Failed to write handshake request")]
+    WriteHandshakeFailed,
+    #[error("Failed to read handshake response")]
+    ReadHandshakeFailed,
+    #[error("Handshake response too large")]
+    HandshakeResponseTooLarge,
+    #[error("Handshake failed: missing or invalid status code")]
+    HandshakeMissingStatus,
+    #[error("Handshake failed: missing or invalid header: {0}")]
+    HandshakeMissingHeader(&'static str),
+    #[error("Handshake failed: invalid Sec-WebSocket-Accept value")]
+    HandshakeInvalidAccept,
+    #[error("TLS handshake failed")]
+    TlsHandshakeFailed,
+    #[error("Invalid DNS name for TLS")]
+    InvalidDnsName,
+    #[error("Failed to build handshake request")]
+    BuildHandshakeFailed,
+    #[error("Failed to build handshake response")]
+    BuildHandshakeResponseFailed,
+    #[error("Failed to parse handshake response")]
+    ParseHandshakeFailed,
+    #[error("Incomplete handshake response")]
+    IncompleteHandshakeResponse,
+    #[error("Invalid header name")]
+    InvalidHeaderName,
+    #[error("Invalid header value")]
+    InvalidHeaderValue,
+    #[error("Invalid status code")]
+    InvalidStatusCode,
 }
-
-use crate::codec::{self, Opcode};
 
 /// A message returned to end-users from a WebSocket connection.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,250 +60,26 @@ pub enum WebsocketMessage {
     Text(String),
     /// A block of binary data
     Binary(Vec<u8>),
-    /// A close operation with optional reason
-    Close(Option<Vec<u8>>),
+    /// A close operation
+    Close(Option<(CloseReason, String)>),
     /// A ping
     Pong(Vec<u8>),
     /// Response to ping
     Ping(Vec<u8>),
 }
 
-/// Handler for a WebSocket connection, generic over [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`].
-pub struct Connection<T> {
-    framed: tokio_util::codec::Framed<T, codec::WebsocketCodec>,
-    max_frame_size: usize,
-    closed: bool,
-    last_ping: Option<Vec<u8>>,
-    frag_opcode: Option<codec::Opcode>,
-    frag_buffer: Vec<u8>,
+/// A websocket connection
+pub struct Connection {
+    pub(crate) framed:
+        tokio_util::codec::Framed<Box<dyn WebSocketStream + Send>, codec::WebsocketCodec>,
+    pub(crate) max_frame_size: usize,
+    pub(crate) closed: bool,
+    pub(crate) last_ping: Option<Vec<u8>>,
+    pub(crate) frag_opcode: Option<codec::Opcode>,
+    pub(crate) frag_buffer: Vec<u8>,
 }
 
-impl<T> Connection<T>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    /// Perform a client-side WebSocket handshake and return a new insecure (non-TLS) client connection.
-    /// Create a new insecure (non-TLS) WebSocket client connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream`: The underlying stream to use for the connection (e.g., a TCP stream).
-    /// * `host`: The hostname of the server to connect to (used in the handshake).
-    /// * `path`: The request path for the WebSocket handshake (usually "/").
-    /// * `max_frame_size`: The maximum frame size for incoming messages; larger frames will be split.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the handshake fails or the connection cannot be established.
-    pub async fn new_insecure_client(
-        mut stream: T,
-        host: &str,
-        path: &str,
-        max_frame_size: usize,
-    ) -> Result<Self, ConnectionError> {
-        use base64::engine::general_purpose::STANDARD as base64;
-        use base64::Engine;
-        use rand::RngCore;
-        use sha1::{Digest, Sha1};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Generate a random key
-        let mut key_bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut key_bytes);
-        let key = base64.encode(key_bytes);
-
-        // Write handshake request
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        );
-        stream
-            .write_all(req.as_bytes())
-            .await
-            .map_err(|_| ConnectionError::ProtocolViolation("Failed to write handshake request"))?;
-
-        // Read handshake response
-        let mut response = Vec::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut buf).await.map_err(|_| {
-                ConnectionError::ProtocolViolation("Failed to read handshake response")
-            })?;
-            if n == 0 {
-                return Err(ConnectionError::ProtocolViolation(
-                    "Connection closed during handshake",
-                ));
-            }
-            response.extend_from_slice(&buf[..n]);
-            if response.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-            if response.len() > 8192 {
-                return Err(ConnectionError::ProtocolViolation(
-                    "Handshake response too large",
-                ));
-            }
-        }
-        let response_str = String::from_utf8_lossy(&response);
-        if !response_str.starts_with("HTTP/1.1 101") {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake failed: missing 101 status",
-            ));
-        }
-        if !response_str
-            .to_ascii_lowercase()
-            .contains("upgrade: websocket")
-        {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake failed: missing upgrade header",
-            ));
-        }
-        if !response_str
-            .to_ascii_lowercase()
-            .contains("connection: upgrade")
-        {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake failed: missing connection header",
-            ));
-        }
-        // Validate Sec-WebSocket-Accept
-        let accept_line = response_str
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:"));
-        let expected_accept = {
-            let mut sha1 = Sha1::new();
-            sha1.update(key.as_bytes());
-            sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-            base64.encode(sha1.finalize())
-        };
-        match accept_line {
-            Some(line) => {
-                let actual = line.split(':').nth(1).map(str::trim);
-                if actual != Some(expected_accept.as_str()) {
-                    return Err(ConnectionError::ProtocolViolation(
-                        "Invalid Sec-WebSocket-Accept value",
-                    ));
-                }
-            }
-            None => {
-                return Err(ConnectionError::ProtocolViolation(
-                    "Missing Sec-WebSocket-Accept header",
-                ))
-            }
-        }
-
-        let codec = codec::WebsocketCodec::new(codec::EndpointType::Client, max_frame_size);
-        Ok(Self {
-            framed: tokio_util::codec::Framed::new(stream, codec),
-            max_frame_size,
-            closed: false,
-            last_ping: None,
-            frag_opcode: None,
-            frag_buffer: Vec::new(),
-        })
-    }
-
-    /// Accept a server-side WebSocket handshake and return a new insecure (non-TLS) server connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream`: The underlying stream to use for the connection (e.g., a TCP stream).
-    /// * `max_frame_size`: The maximum frame size for incoming messages; larger frames will be split.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the handshake fails or the connection cannot be established.
-    pub async fn new_insecure_server(
-        mut stream: T,
-        max_frame_size: usize,
-    ) -> Result<Self, ConnectionError> {
-        use base64::engine::general_purpose::STANDARD as base64;
-        use base64::Engine;
-        use sha1::{Digest, Sha1};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Read handshake request
-        let mut request = Vec::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut buf).await.map_err(|_| {
-                ConnectionError::ProtocolViolation("Failed to read handshake request")
-            })?;
-            if n == 0 {
-                return Err(ConnectionError::ProtocolViolation(
-                    "Connection closed during handshake",
-                ));
-            }
-            request.extend_from_slice(&buf[..n]);
-            if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-            if request.len() > 8192 {
-                return Err(ConnectionError::ProtocolViolation(
-                    "Handshake request too large",
-                ));
-            }
-        }
-        let request_str = String::from_utf8_lossy(&request);
-        if !request_str.starts_with("GET ") {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake request must start with GET",
-            ));
-        }
-        if !request_str
-            .to_ascii_lowercase()
-            .contains("upgrade: websocket")
-        {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake failed: missing upgrade header",
-            ));
-        }
-        if !request_str
-            .to_ascii_lowercase()
-            .contains("connection: upgrade")
-        {
-            return Err(ConnectionError::ProtocolViolation(
-                "Handshake failed: missing connection header",
-            ));
-        }
-        // Extract Sec-WebSocket-Key
-        let key_line = request_str
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"));
-        let key =
-            match key_line {
-                Some(line) => line.split(':').nth(1).map(str::trim).ok_or(
-                    ConnectionError::ProtocolViolation("Malformed Sec-WebSocket-Key header"),
-                )?,
-                None => {
-                    return Err(ConnectionError::ProtocolViolation(
-                        "Missing Sec-WebSocket-Key header",
-                    ))
-                }
-            };
-        // Compute accept value
-        let mut sha1 = Sha1::new();
-        sha1.update(key.as_bytes());
-        sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        let accept = base64.encode(sha1.finalize());
-        // Write handshake response
-        let response = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-        );
-        stream.write_all(response.as_bytes()).await.map_err(|_| {
-            ConnectionError::ProtocolViolation("Failed to write handshake response")
-        })?;
-
-        let codec = codec::WebsocketCodec::new(codec::EndpointType::Server, max_frame_size);
-        Ok(Self {
-            framed: tokio_util::codec::Framed::new(stream, codec),
-            max_frame_size,
-            closed: false,
-            last_ping: None,
-            frag_opcode: None,
-            frag_buffer: Vec::new(),
-        })
-    }
-
+impl Connection {
     /// Send a text message, splitting into frames if needed.
     /// # Errors
     /// Returns an error if the connection is closed or sending fails.
@@ -464,15 +209,52 @@ where
             Opcode::ConnectionClose => {
                 let _ = self.send_data(&f.payload, Opcode::ConnectionClose).await;
                 self.closed = true;
-                let reason = if f.payload.is_empty() {
+                let close_info = if f.payload.is_empty() {
                     None
+                } else if f.payload.len() >= 2 {
+                    let code = u16::from_be_bytes([f.payload[0], f.payload[1]]);
+                    let reason = if f.payload.len() > 2 {
+                        match std::str::from_utf8(&f.payload[2..]) {
+                            Ok(s) => s.to_owned(),
+                            Err(_) => String::from("Invalid UTF-8 in close reason"),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    match CloseReason::try_from(code) {
+                        Ok(r) => Some((r, reason)),
+                        Err(()) => Some((CloseReason::NormalClosure, reason)),
+                    }
                 } else {
-                    Some(f.payload.clone())
+                    None
                 };
-                Some(Ok(WebsocketMessage::Close(reason)))
+                Some(Ok(WebsocketMessage::Close(close_info)))
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Send a close frame with an optional reason code.
+    /// If a reason is provided, the reason string will be the Display of the [`CloseReason`].
+    /// # Errors
+    /// Returns an error if the connection is closed or sending fails.
+    pub async fn send_close(&mut self, reason: Option<CloseReason>) -> Result<(), ConnectionError> {
+        if self.closed {
+            return Err(ConnectionError::Closed);
+        }
+        let payload = if let Some(r) = reason {
+            let mut data = Vec::with_capacity(2 + 64); // 2 bytes for code, rest for string
+            data.extend_from_slice(&u16::from(r).to_be_bytes());
+            let reason_str = r.to_string();
+            data.extend_from_slice(reason_str.as_bytes());
+            data
+        } else {
+            Vec::new()
+        };
+        self.send_data(&payload, crate::codec::Opcode::ConnectionClose)
+            .await?;
+        self.closed = true;
+        Ok(())
     }
 
     fn handle_data_frame(
@@ -486,14 +268,12 @@ where
         }
         if f.fin {
             if f.opcode == Opcode::TextFrame {
-                match std::str::from_utf8(&f.payload) {
-                    Ok(s) => return Some(Ok(WebsocketMessage::Text(s.to_owned()))),
-                    Err(_) => {
-                        return Some(Err(ConnectionError::ProtocolViolation(
-                            "Invalid UTF-8 in text frame",
-                        )))
-                    }
+                if let Ok(s) = std::str::from_utf8(&f.payload) {
+                    return Some(Ok(WebsocketMessage::Text(s.to_owned())));
                 }
+                return Some(Err(ConnectionError::ProtocolViolation(
+                    "Invalid UTF-8 in text frame",
+                )));
             }
             return Some(Ok(WebsocketMessage::Binary(f.payload.clone())));
         }
@@ -511,6 +291,15 @@ where
             return Some(Err(ConnectionError::ProtocolViolation(
                 "Continuation frame without initial data frame",
             )));
+        }
+        // If this is a fragmented text message, check that the new fragment is valid UTF-8 up to this point
+        if self.frag_opcode == Some(Opcode::TextFrame) {
+            // Check that the new fragment is valid UTF-8 (not the whole buffer, just the new payload)
+            if !f.payload.is_empty() && std::str::from_utf8(&f.payload).is_err() {
+                return Some(Err(ConnectionError::ProtocolViolation(
+                    "Invalid UTF-8 in continuation frame of fragmented text message",
+                )));
+            }
         }
         self.frag_buffer.extend_from_slice(&f.payload);
         if f.fin {
@@ -530,5 +319,118 @@ where
             return Some(Ok(WebsocketMessage::Binary(payload)));
         }
         None
+    }
+}
+
+// WebSocket close reason codes as defined in RFC 6455 §7.4.1
+#[repr(u16)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CloseReason {
+    /// 1000: Normal closure
+    NormalClosure = 1000,
+    /// 1001: Endpoint is going away
+    GoingAway = 1001,
+    /// 1002: Protocol error
+    ProtocolError = 1002,
+    /// 1003: Unsupported data
+    UnsupportedData = 1003,
+    /// 1005: No status received (reserved, not to be sent)
+    NoStatusReceived = 1005,
+    /// 1006: Abnormal closure (reserved, not to be sent)
+    AbnormalClosure = 1006,
+    /// 1007: Invalid payload data
+    InvalidPayloadData = 1007,
+    /// 1008: Policy violation
+    PolicyViolation = 1008,
+    /// 1009: Message too big
+    MessageTooBig = 1009,
+    /// 1010: Mandatory extension (client only)
+    MandatoryExtension = 1010,
+    /// 1011: Internal server error
+    InternalServerError = 1011,
+    /// 1012: Service restart (optional, not in RFC 6455, but in IANA registry)
+    ServiceRestart = 1012,
+    /// 1013: Try again later (optional, not in RFC 6455, but in IANA registry)
+    TryAgainLater = 1013,
+    /// 1014: Bad gateway (optional, not in RFC 6455, but in IANA registry)
+    BadGateway = 1014,
+    /// 1015: TLS handshake failure (reserved, not to be sent)
+    TlsHandshake = 1015,
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloseReason::NormalClosure => write!(f, "Normal closure"),
+            CloseReason::GoingAway => write!(f, "Endpoint is going away"),
+            CloseReason::ProtocolError => write!(f, "Protocol error"),
+            CloseReason::UnsupportedData => write!(f, "Unsupported data"),
+            CloseReason::NoStatusReceived => write!(f, "No status received"),
+            CloseReason::AbnormalClosure => write!(f, "Abnormal closure"),
+            CloseReason::InvalidPayloadData => write!(f, "Invalid payload data"),
+            CloseReason::PolicyViolation => write!(f, "Policy violation"),
+            CloseReason::MessageTooBig => write!(f, "Message too big"),
+            CloseReason::MandatoryExtension => write!(f, "Mandatory extension"),
+            CloseReason::InternalServerError => write!(f, "Internal server error"),
+            CloseReason::ServiceRestart => write!(f, "Service restart"),
+            CloseReason::TryAgainLater => write!(f, "Try again later"),
+            CloseReason::BadGateway => write!(f, "Bad gateway"),
+            CloseReason::TlsHandshake => write!(f, "TLS handshake failure"),
+        }
+    }
+}
+
+impl TryFrom<u16> for CloseReason {
+    type Error = ();
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1000 => Ok(CloseReason::NormalClosure),
+            1001 => Ok(CloseReason::GoingAway),
+            1002 => Ok(CloseReason::ProtocolError),
+            1003 => Ok(CloseReason::UnsupportedData),
+            1005 => Ok(CloseReason::NoStatusReceived),
+            1006 => Ok(CloseReason::AbnormalClosure),
+            1007 => Ok(CloseReason::InvalidPayloadData),
+            1008 => Ok(CloseReason::PolicyViolation),
+            1009 => Ok(CloseReason::MessageTooBig),
+            1010 => Ok(CloseReason::MandatoryExtension),
+            1011 => Ok(CloseReason::InternalServerError),
+            1012 => Ok(CloseReason::ServiceRestart),
+            1013 => Ok(CloseReason::TryAgainLater),
+            1014 => Ok(CloseReason::BadGateway),
+            1015 => Ok(CloseReason::TlsHandshake),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<[u8; 2]> for CloseReason {
+    type Error = ();
+    fn try_from(value: [u8; 2]) -> Result<Self, Self::Error> {
+        let code = u16::from_be_bytes(value);
+        CloseReason::try_from(code)
+    }
+}
+
+impl TryFrom<&[u8]> for CloseReason {
+    type Error = ();
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != 2 {
+            return Err(());
+        }
+        let code = u16::from_be_bytes([value[0], value[1]]);
+        CloseReason::try_from(code)
+    }
+}
+
+impl From<CloseReason> for u16 {
+    fn from(value: CloseReason) -> Self {
+        value as u16
+    }
+}
+
+impl From<CloseReason> for [u8; 2] {
+    fn from(value: CloseReason) -> Self {
+        (value as u16).to_be_bytes()
     }
 }

@@ -1,20 +1,15 @@
 //! An example of a client that doesn't use TLS termination
 
 use allagan_websocket::Connection;
-use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Address and host for the WebSocket server (non-TLS)
-    let host = "echo.websocket.org";
-    let path = "/";
+    let uri = http::Uri::from_static("ws://echo.websocket.org/");
     let max_frame_size = 4096;
 
-    // Connect TCP (port 80 for insecure WebSocket)
-    let stream = TcpStream::connect((host, 80)).await?;
-
-    // Perform the WebSocket handshake (no TLS)
-    let mut conn = Connection::new_insecure_client(stream, host, path, max_frame_size).await?;
+    // Create the connection (no TLS)
+    let mut conn = Connection::builder(uri, max_frame_size).connect().await?;
 
     // Send a text message
     conn.send_text("Hello, insecure WebSocket!").await?;
