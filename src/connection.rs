@@ -413,99 +413,122 @@ where
     /// Panics if internal state has gone absolutely bonkers, which should never happen.
     pub async fn next_message(&mut self) -> Option<Result<WebsocketMessage, ConnectionError>> {
         use futures_util::StreamExt;
-        loop {
-            let frame = self.framed.next().await?;
-            match &frame {
-                Ok(f) => match f.opcode {
-                    Opcode::Ping | Opcode::Pong | Opcode::ConnectionClose => {
-                        if f.payload.len() > 125 {
-                            return Some(Err(ConnectionError::ProtocolViolation(
-                                "Control frame payload exceeds 125 bytes",
-                            )));
-                        }
-                        match f.opcode {
-                            Opcode::Ping => {
-                                let _ = self.send_data(&f.payload, Opcode::Pong).await;
-                                return Some(Ok(WebsocketMessage::Ping(f.payload.clone())));
-                            }
-                            Opcode::Pong => {
-                                if let Some(last) = &self.last_ping {
-                                    if &f.payload != last {
-                                        return Some(Err(ConnectionError::ProtocolViolation(
-                                            "Pong payload does not match last ping",
-                                        )));
-                                    }
-                                } else if !f.payload.is_empty() {
-                                    return Some(Err(ConnectionError::ProtocolViolation(
-                                        "Unexpected pong with payload",
-                                    )));
-                                }
-                                self.last_ping = None;
-                                return Some(Ok(WebsocketMessage::Pong(f.payload.clone())));
-                            }
-                            Opcode::ConnectionClose => {
-                                let _ = self.send_data(&f.payload, Opcode::ConnectionClose).await;
-                                self.closed = true;
-                                let reason = if f.payload.is_empty() {
-                                    None
-                                } else {
-                                    Some(f.payload.clone())
-                                };
-                                return Some(Ok(WebsocketMessage::Close(reason)));
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    Opcode::TextFrame | Opcode::BinaryFrame => {
-                        if self.frag_opcode.is_some() {
-                            return Some(Err(ConnectionError::ProtocolViolation(
-                                "New data frame started before previous fragmented message completed",
-                            )));
-                        }
-                        if f.fin {
-                            if f.opcode == Opcode::TextFrame {
-                                match std::str::from_utf8(&f.payload) {
-                                    Ok(s) => return Some(Ok(WebsocketMessage::Text(s.to_owned()))),
-                                    Err(_) => {
-                                        return Some(Err(ConnectionError::ProtocolViolation(
-                                            "Invalid UTF-8 in text frame",
-                                        )))
-                                    }
-                                }
-                            }
-                            return Some(Ok(WebsocketMessage::Binary(f.payload.clone())));
-                        }
-                        self.frag_opcode = Some(f.opcode);
-                        self.frag_buffer.clear();
-                        self.frag_buffer.extend_from_slice(&f.payload);
-                    }
-                    Opcode::ContinuationFrame => {
-                        if self.frag_opcode.is_none() {
-                            return Some(Err(ConnectionError::ProtocolViolation(
-                                "Continuation frame without initial data frame",
-                            )));
-                        }
-                        self.frag_buffer.extend_from_slice(&f.payload);
-                        if f.fin {
-                            #[allow(clippy::expect_used, reason = "Checked is_some above")]
-                            let opcode = self.frag_opcode.take().expect("Checked is_some above");
-                            let payload = std::mem::take(&mut self.frag_buffer);
-                            if opcode == Opcode::TextFrame {
-                                match std::str::from_utf8(&payload) {
-                                    Ok(s) => return Some(Ok(WebsocketMessage::Text(s.to_owned()))),
-                                    Err(_) => {
-                                        return Some(Err(ConnectionError::ProtocolViolation(
-                                            "Invalid UTF-8 in fragmented text message",
-                                        )))
-                                    }
-                                }
-                            }
-                            return Some(Ok(WebsocketMessage::Binary(payload)));
-                        }
-                    }
-                },
-                Err(e) => return Some(Err(ConnectionError::Codec((*e).clone()))),
-            }
+
+        let frame = self.framed.next().await?;
+        match &frame {
+            Ok(f) => match f.opcode {
+                Opcode::Ping | Opcode::Pong | Opcode::ConnectionClose => {
+                    return self.handle_control_frame(f).await;
+                }
+                Opcode::TextFrame | Opcode::BinaryFrame => self.handle_data_frame(f),
+                Opcode::ContinuationFrame => self.handle_continuation_frame(f),
+            },
+            Err(e) => Some(Err(ConnectionError::Codec((*e).clone()))),
         }
+    }
+
+    async fn handle_control_frame(
+        &mut self,
+        f: &crate::codec::WebsocketFrame,
+    ) -> Option<Result<WebsocketMessage, ConnectionError>> {
+        if f.payload.len() > 125 {
+            return Some(Err(ConnectionError::ProtocolViolation(
+                "Control frame payload exceeds 125 bytes",
+            )));
+        }
+        if !f.fin {
+            return Some(Err(ConnectionError::ProtocolViolation(
+                "Control frames must not be fragmented",
+            )));
+        }
+        match f.opcode {
+            Opcode::Ping => {
+                let _ = self.send_data(&f.payload, Opcode::Pong).await;
+                Some(Ok(WebsocketMessage::Ping(f.payload.clone())))
+            }
+            Opcode::Pong => {
+                if let Some(last) = &self.last_ping {
+                    if &f.payload != last {
+                        return Some(Err(ConnectionError::ProtocolViolation(
+                            "Pong payload does not match last ping",
+                        )));
+                    }
+                } else if !f.payload.is_empty() {
+                    return Some(Err(ConnectionError::ProtocolViolation(
+                        "Unexpected pong with payload",
+                    )));
+                }
+                self.last_ping = None;
+                Some(Ok(WebsocketMessage::Pong(f.payload.clone())))
+            }
+            Opcode::ConnectionClose => {
+                let _ = self.send_data(&f.payload, Opcode::ConnectionClose).await;
+                self.closed = true;
+                let reason = if f.payload.is_empty() {
+                    None
+                } else {
+                    Some(f.payload.clone())
+                };
+                Some(Ok(WebsocketMessage::Close(reason)))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn handle_data_frame(
+        &mut self,
+        f: &crate::codec::WebsocketFrame,
+    ) -> Option<Result<WebsocketMessage, ConnectionError>> {
+        if self.frag_opcode.is_some() {
+            return Some(Err(ConnectionError::ProtocolViolation(
+                "New data frame started before previous fragmented message completed",
+            )));
+        }
+        if f.fin {
+            if f.opcode == Opcode::TextFrame {
+                match std::str::from_utf8(&f.payload) {
+                    Ok(s) => return Some(Ok(WebsocketMessage::Text(s.to_owned()))),
+                    Err(_) => {
+                        return Some(Err(ConnectionError::ProtocolViolation(
+                            "Invalid UTF-8 in text frame",
+                        )))
+                    }
+                }
+            }
+            return Some(Ok(WebsocketMessage::Binary(f.payload.clone())));
+        }
+        self.frag_opcode = Some(f.opcode);
+        self.frag_buffer.clear();
+        self.frag_buffer.extend_from_slice(&f.payload);
+        None
+    }
+
+    fn handle_continuation_frame(
+        &mut self,
+        f: &crate::codec::WebsocketFrame,
+    ) -> Option<Result<WebsocketMessage, ConnectionError>> {
+        if self.frag_opcode.is_none() {
+            return Some(Err(ConnectionError::ProtocolViolation(
+                "Continuation frame without initial data frame",
+            )));
+        }
+        self.frag_buffer.extend_from_slice(&f.payload);
+        if f.fin {
+            #[allow(clippy::expect_used, reason = "Checked is_some above")]
+            let opcode = self.frag_opcode.take().expect("Checked is_some above");
+            let payload = std::mem::take(&mut self.frag_buffer);
+            if opcode == Opcode::TextFrame {
+                match std::str::from_utf8(&payload) {
+                    Ok(s) => return Some(Ok(WebsocketMessage::Text(s.to_owned()))),
+                    Err(_) => {
+                        return Some(Err(ConnectionError::ProtocolViolation(
+                            "Invalid UTF-8 in fragmented text message",
+                        )))
+                    }
+                }
+            }
+            return Some(Ok(WebsocketMessage::Binary(payload)));
+        }
+        None
     }
 }
