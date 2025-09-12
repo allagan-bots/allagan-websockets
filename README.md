@@ -18,8 +18,11 @@ allagan-websocket = "0.1"
 ```
 
 ## Examples
-| [Insecure Client](./examples/insecure_client.rs) | Creates a connection to a ws:// server |
-| [Secure Client](./examples/secure_client.rs) | Creates a connection to a wss:// server |
+
+| Example                                          | Description                             |
+| ------------------------------------------------ | --------------------------------------  |
+| [Insecure Client](./examples/insecure_client.rs) | Creates a connection to a ws:// server  |
+| [Secure Client](./examples/secure_client.rs)     | Creates a connection to a wss:// server |
 
 ## Documentation
 
