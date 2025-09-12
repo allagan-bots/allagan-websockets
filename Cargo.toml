@@ -5,6 +5,16 @@ edition = "2021"
 authors = ["Underscore Nul <underscore.nul@proton.me>"]
 license = "MIT OR Apache-2.0"
 description = "A WebSocket protocol implementation in Rust."
+readme = "README.md"
+repository = "https://github.com/allagan-bots/allagan-websocket"
+keywords = ["websocket", "ws", "wss", "async"]
+categories = [
+    "network-programming",
+    "asynchronous",
+    "protocols",
+    "web-programming",
+]
+
 
 [dependencies]
 base64 = "0.22.1"
