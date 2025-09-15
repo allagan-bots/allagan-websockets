@@ -9,6 +9,7 @@
 //! WebSocket protocol as defined in RFC 6455.
 pub(crate) mod codec;
 pub(crate) mod connection;
+pub(crate) mod errors;
 
-pub use connection::{client::ClientConnectionBuilder, Connection, WebsocketMessage};
+pub use connection::{ClientConnectionBuilder, Connection, WebsocketMessage};
 pub use http;

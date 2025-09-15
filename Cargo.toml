@@ -1,10 +1,10 @@
 [package]
 name = "allagan-websocket"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Underscore Nul <underscore.nul@proton.me>"]
 license = "MIT OR Apache-2.0"
-description = "A WebSocket protocol implementation in Rust."
+description = "A WebSocket protocol client implementation in Rust."
 readme = "README.md"
 repository = "https://github.com/allagan-bots/allagan-websocket"
 keywords = ["websocket", "ws", "wss", "async"]
