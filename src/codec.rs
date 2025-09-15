@@ -51,32 +51,7 @@ impl From<Opcode> for u8 {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum WebsocketCodecError {
-    #[error("Unknown Opcode {0}")]
-    UnknownOpcode(u8),
-    #[error("IO Error: {0}")]
-    IOError(#[from] std::io::Error),
-    #[error("Packet too big: {0} bytes")]
-    SizeError(u64),
-    #[error("Protocol violation: {0}")]
-    ProtocolViolation(&'static str),
-}
-
-impl Clone for WebsocketCodecError {
-    fn clone(&self) -> Self {
-        match self {
-            WebsocketCodecError::UnknownOpcode(op) => WebsocketCodecError::UnknownOpcode(*op),
-            WebsocketCodecError::IOError(e) => {
-                WebsocketCodecError::IOError(std::io::Error::new(e.kind(), e.to_string()))
-            }
-            WebsocketCodecError::SizeError(size) => WebsocketCodecError::SizeError(*size),
-            WebsocketCodecError::ProtocolViolation(msg) => {
-                WebsocketCodecError::ProtocolViolation(msg)
-            }
-        }
-    }
-}
+use crate::errors::WebsocketCodecError;
 
 #[derive(Clone, Debug)]
 pub struct WebsocketFrame {
@@ -85,6 +60,10 @@ pub struct WebsocketFrame {
     pub(crate) payload: Vec<u8>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Will be used if module is extracted into a crate."
+)]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum EndpointType {
     Client,
